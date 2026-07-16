@@ -239,13 +239,6 @@ cd frontend && npm install && npm run dev
 2.  **提交信息**: 必须使用 **中文** 编写 Commit Message，清晰描述变更内容。
 3.  **测试验收**: 新增功能时，请更新 `tests/CHECKLIST.md`。
 
----
-
-## 💬 联系与交流
-
-如果您在使用过程中有任何疑问、功能建议，或者想要获取更多技术资讯，欢迎扫码关注我们的微信公众号：
-
-<img src="docs/images/weixin.png" alt="微信公众号" width="200" />
 
 ---
 
