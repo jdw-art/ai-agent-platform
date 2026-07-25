@@ -1,12 +1,19 @@
 from fastapi import APIRouter, Depends
 from app.core.dependencies import require_admin, require_api_key
 
-from app.api.portal.endpoints import auth, audit, management, roles, changelog
+from app.api.portal.endpoints import auth, audit, management, roles, changelog, dashboard, agents
 
 portal_router = APIRouter()
 
 # 1. 认证 (Auth)
 portal_router.include_router(auth.router, prefix="/auth", tags=["认证"])
+
+# 2. 仪表盘 (Dashboard)
+portal_router.include_router(dashboard.router, prefix="/dashboard", tags=["仪表盘"], dependencies=[Depends(require_api_key)])
+
+# 3. 智能体管理 (Agents)
+portal_router.include_router(agents.router, prefix="/agents", tags=["智能体管理"], dependencies=[Depends(require_api_key)])
+
 
 # 5. 审计日志 (Audit)
 portal_router.include_router(audit.router, prefix="/audit", tags=["审计日志"], dependencies=[Depends(require_api_key)])
