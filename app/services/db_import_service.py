@@ -1,0 +1,328 @@
+import logging
+import aiomysql
+import asynch
+import oracledb
+import asyncio
+import os
+from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
+
+class DBImportService:
+    @staticmethod
+    async def test_mysql_connection(config: Dict[str, Any]) -> bool:
+        """测试 MySQL 连接"""
+        try:
+            conn = await aiomysql.connect(
+                host=config.get('host'),
+                port=int(config.get('port', 3306)),
+                user=config.get('user'),
+                password=config.get('password'),
+                db=config.get('database'),
+                connect_timeout=10
+            )
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"MySQL connection test failed: {e}")
+            raise Exception(f"MySQL 连接失败: {str(e)}")
+
+    @staticmethod
+    async def test_clickhouse_connection(config: Dict[str, Any]) -> bool:
+        """测试 ClickHouse 连接"""
+        try:
+            # Note: ClickHouse common ports are 9000 (TCP) and 8123 (HTTP).
+            # 'asynch' uses the native TCP protocol.
+            port = int(config.get('port', 9000))
+            if port == 8123:
+                 raise Exception("端口 8123 为 HTTP 协议，当前系统仅支持 9000 (TCP) 协议。请确认端口设置。")
+            
+            conn = asynch.Connection(
+                host=config.get('host'),
+                port=port,
+                user=config.get('user'),
+                password=config.get('password'),
+                database=config.get('database'),
+                connect_timeout=10
+            )
+            await conn.connect()
+            await conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"ClickHouse connection test failed: {e}")
+            raise Exception(f"ClickHouse 连接失败: {str(e)}")
+
+    @staticmethod
+    async def get_mysql_tables(config: Dict[str, Any]) -> List[Dict[str, str]]:
+        """获取 MySQL 表列表及其备注 (包含视图类型)"""
+        try:
+            conn = await aiomysql.connect(
+                host=config.get('host'),
+                port=int(config.get('port', 3306)),
+                user=config.get('user'),
+                password=config.get('password'),
+                db=config.get('database')
+            )
+            async with conn.cursor() as cur:
+                # Query information_schema for names, comments, and types
+                query = """
+                    SELECT TABLE_NAME, TABLE_COMMENT, TABLE_TYPE 
+                    FROM information_schema.TABLES 
+                    WHERE TABLE_SCHEMA = %s
+                """
+                await cur.execute(query, (config.get('database'),))
+                res = await cur.fetchall()
+                return [
+                    {
+                        "name": row[0], 
+                        "comment": row[1] or "", 
+                        "type": "view" if "VIEW" in row[2].upper() else "table"
+                    } for row in res
+                ]
+        finally:
+            conn.close()
+
+    @staticmethod
+    async def get_clickhouse_tables(config: Dict[str, Any]) -> List[Dict[str, str]]:
+        """获取 ClickHouse 表列表及其备注 (包含视图类型)"""
+        try:
+            port = int(config.get('port', 9000))
+            conn = asynch.Connection(
+                host=config.get('host'),
+                port=port,
+                user=config.get('user'),
+                password=config.get('password'),
+                database=config.get('database'),
+                connect_timeout=10
+            )
+            await conn.connect()
+            async with conn.cursor() as cur:
+                # Use system.tables for name, comment and engine. 
+                try:
+                    query = "SELECT name, comment, engine FROM system.tables WHERE database = currentDatabase()"
+                    await cur.execute(query)
+                    res = await cur.fetchall()
+                    logger.info(f"Loaded {len(res)} tables/views from ClickHouse database: {config.get('database')}")
+                    return [
+                        {
+                            "name": row[0], 
+                            "comment": row[1] or "", 
+                            "type": "view" if "View" in (row[2] or "") else "table"
+                        } for row in res
+                    ]
+                except Exception as e:
+                    # Fallback for ClickHouse versions without 'comment' column
+                    if "Missing columns" in str(e) or "Code: 47" in str(e):
+                        logger.warning(f"ClickHouse system.tables missing 'comment' column, falling back. Error: {e}")
+                        query = "SELECT name, engine FROM system.tables WHERE database = currentDatabase()"
+                        await cur.execute(query)
+                        res = await cur.fetchall()
+                        return [
+                            {
+                                "name": row[0], 
+                                "comment": "", 
+                                "type": "view" if "View" in (row[1] or "") else "table"
+                            } for row in res
+                        ]
+                    raise e
+        except Exception as e:
+            logger.error(f"Failed to get ClickHouse tables: {e}")
+            raise Exception(f"获取 ClickHouse 表列表失败: {str(e)}")
+        finally:
+            if 'conn' in locals():
+                await conn.close()
+
+    @staticmethod
+    async def get_mysql_ddl(config: Dict[str, Any], table_names: List[str]) -> str:
+        """获取 MySQL DDL"""
+        ddls = []
+        try:
+            conn = await aiomysql.connect(
+                host=config.get('host'),
+                port=int(config.get('port', 3306)),
+                user=config.get('user'),
+                password=config.get('password'),
+                db=config.get('database')
+            )
+            async with conn.cursor() as cur:
+                for table in table_names:
+                    await cur.execute(f"SHOW CREATE TABLE `{table}`")
+                    res = await cur.fetchone()
+                    if res:
+                        ddls.append(res[1] + ";")
+            return "\n\n".join(ddls)
+        finally:
+            conn.close()
+
+    @staticmethod
+    async def get_clickhouse_ddl(config: Dict[str, Any], table_names: List[str]) -> str:
+        """获取 ClickHouse DDL"""
+        ddls = []
+        try:
+            port = int(config.get('port', 9000))
+            conn = asynch.Connection(
+                host=config.get('host'),
+                port=port,
+                user=config.get('user'),
+                password=config.get('password'),
+                database=config.get('database'),
+                connect_timeout=10
+            )
+            await conn.connect()
+            async with conn.cursor() as cur:
+                for table in table_names:
+                    await cur.execute(f"SHOW CREATE TABLE `{table}`")
+                    res = await cur.fetchone()
+                    if res:
+                        ddls.append(res[0] + ";")
+            return "\n\n".join(ddls)
+        except Exception as e:
+            logger.error(f"Failed to get ClickHouse DDL: {e}")
+            raise Exception(f"获取 ClickHouse DDL 失败: {str(e)}")
+        finally:
+            if 'conn' in locals():
+                await conn.close()
+
+    @staticmethod
+    async def _get_oracle_dsn(config: Dict[str, Any]) -> str:
+        """构建 Oracle DSN"""
+        return oracledb.makedsn(
+            config.get('host'),
+            int(config.get('port', 1521)),
+            sid=config.get('database') if not config.get('service_name') else None,
+            service_name=config.get('service_name')
+        )
+
+    @staticmethod
+    async def test_oracle_connection(config: Dict[str, Any]) -> bool:
+        """测试 Oracle 连接"""
+        try:
+            dsn = await DBImportService._get_oracle_dsn(config)
+            user = config.get('user')
+            password = config.get('password')
+
+            if os.environ.get("USE_ORACLE_THICK_MODE") == "1":
+                # 厚模式：使用同步驱动 + 线程包装
+                def sync_op():
+                    with oracledb.connect(user=user, password=password, dsn=dsn) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT 1 FROM DUAL")
+                            cur.fetchone()
+                    return True
+                return await asyncio.to_thread(sync_op)
+            else:
+                # 薄模式：原生异步
+                conn = await oracledb.connect_async(user=user, password=password, dsn=dsn)
+                async with conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("SELECT 1 FROM DUAL")
+                        await cur.fetchone()
+                return True
+        except Exception as e:
+            logger.error(f"Oracle connection test failed: {e}")
+            raise Exception(f"Oracle 连接失败: {str(e)}")
+
+    @staticmethod
+    async def get_oracle_tables(config: Dict[str, Any]) -> List[Dict[str, str]]:
+        """获取 Oracle 表列表及其备注 (包含视图类型)"""
+        try:
+            dsn = await DBImportService._get_oracle_dsn(config)
+            user = config.get('user')
+            password = config.get('password')
+
+            query = "SELECT TABLE_NAME, COMMENTS, TABLE_TYPE FROM USER_TAB_COMMENTS WHERE TABLE_TYPE IN ('TABLE', 'VIEW')"
+
+            if os.environ.get("USE_ORACLE_THICK_MODE") == "1":
+                # 厚模式：使用同步驱动 + 线程包装
+                def sync_op():
+                    with oracledb.connect(user=user, password=password, dsn=dsn) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(query)
+                            res = cur.fetchall()
+                            return [
+                                {
+                                    "name": row[0], 
+                                    "comment": row[1] or "", 
+                                    "type": "view" if row[2] == "VIEW" else "table"
+                                } for row in res
+                            ]
+                return await asyncio.to_thread(sync_op)
+            else:
+                # 薄模式：原生异步
+                conn = await oracledb.connect_async(user=user, password=password, dsn=dsn)
+                async with conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(query)
+                        res = await cur.fetchall()
+                        return [
+                            {
+                                "name": row[0], 
+                                "comment": row[1] or "", 
+                                "type": "view" if row[2] == "VIEW" else "table"
+                            } for row in res
+                        ]
+        except Exception as e:
+            logger.error(f"Failed to get Oracle tables: {e}")
+            raise Exception(f"获取 Oracle 表列表失败: {str(e)}")
+
+    @staticmethod
+    async def get_oracle_ddl(config: Dict[str, Any], table_names: List[str]) -> str:
+        """获取 Oracle DDL (支持 TABLE 和 VIEW)"""
+        try:
+            dsn = await DBImportService._get_oracle_dsn(config)
+            user = config.get('user')
+            password = config.get('password')
+
+            # 首先查询这些对象的类型
+            names_placeholders = ",".join([f":{i+1}" for i in range(len(table_names))])
+            type_query = f"SELECT TABLE_NAME, TABLE_TYPE FROM USER_TAB_COMMENTS WHERE TABLE_NAME IN ({names_placeholders})"
+            
+            async def process_ddls(cur, table_types_map):
+                ddls = []
+                # 设置转换参数
+                await cur.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', false); END;")
+                await cur.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'STORAGE', false); END;")
+                await cur.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SQLTERMINATOR', true); END;")
+                
+                for table in table_names:
+                    obj_type = table_types_map.get(table.upper(), "TABLE")
+                    # DBMS_METADATA 对于视图需要使用 'VIEW'
+                    await cur.execute(f"SELECT DBMS_METADATA.GET_DDL(:1, :2) FROM DUAL", [obj_type, table.upper()])
+                    res = await cur.fetchone()
+                    if res:
+                        ddls.append(str(res[0]).strip())
+                return "\n\n".join(ddls)
+
+            def sync_process_ddls(cur, table_types_map):
+                ddls = []
+                cur.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', false); END;")
+                cur.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'STORAGE', false); END;")
+                cur.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SQLTERMINATOR', true); END;")
+                for table in table_names:
+                    obj_type = table_types_map.get(table.upper(), "TABLE")
+                    cur.execute(f"SELECT DBMS_METADATA.GET_DDL(:1, :2) FROM DUAL", [obj_type, table.upper()])
+                    res = cur.fetchone()
+                    if res:
+                        ddls.append(str(res[0]).strip())
+                return "\n\n".join(ddls)
+
+            if os.environ.get("USE_ORACLE_THICK_MODE") == "1":
+                def sync_op():
+                    with oracledb.connect(user=user, password=password, dsn=dsn) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(type_query, [t.upper() for t in table_names])
+                            type_res = cur.fetchall()
+                            table_types_map = {row[0].upper(): row[1] for row in type_res}
+                            return sync_process_ddls(cur, table_types_map)
+                return await asyncio.to_thread(sync_op)
+            else:
+                conn = await oracledb.connect_async(user=user, password=password, dsn=dsn)
+                async with conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(type_query, [t.upper() for t in table_names])
+                        type_res = await cur.fetchall()
+                        table_types_map = {row[0].upper(): row[1] for row in type_res}
+                        return await process_ddls(cur, table_types_map)
+        except Exception as e:
+            logger.error(f"Failed to get Oracle DDL: {e}")
+            raise Exception(f"获取 Oracle DDL 失败: {str(e)}")
