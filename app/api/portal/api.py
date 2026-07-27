@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from app.core.dependencies import require_admin, require_api_key
 
-from app.api.portal.endpoints import auth, audit, management, roles, changelog, dashboard, agents, chat, chat_feedback, chatbi_examples, metadata, system, keys, prompts
+from app.api.portal.endpoints import auth, audit, management, roles, changelog, dashboard, agents, chat, chat_feedback, chatbi_examples, metadata, system, keys, prompts, slash_commands
 
 portal_router = APIRouter()
 
@@ -41,6 +41,9 @@ portal_router.include_router(roles.router, prefix="/roles", tags=["角色管理"
 
 # 9. 提示词工程 (需要登录)
 portal_router.include_router(prompts.router, prefix="/prompts", tags=["提示词管理"], dependencies=[Depends(require_api_key)])
+
+# 10. 快捷指令 (需要登录)
+portal_router.include_router(slash_commands.router, prefix="/slash-commands", tags=["快捷指令"], dependencies=[Depends(require_api_key)])
 
 # 16. 变更日志 (Changelog)
 portal_router.include_router(changelog.router, prefix="/changelog", tags=["变更日志"], dependencies=[Depends(require_api_key)])
