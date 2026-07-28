@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from app.core.dependencies import require_admin, require_api_key
 
-from app.api.portal.endpoints import auth, audit, management, roles, changelog, dashboard, agents, chat, chat_feedback, chatbi_examples, metadata, system, keys, prompts, slash_commands, health, models, tools, ragflow, mcp
+from app.api.portal.endpoints import auth, audit, management, roles, changelog, dashboard, agents, chat, chat_feedback, chatbi_examples, metadata, system, keys, prompts, slash_commands, health, models, tools, ragflow, mcp, skills
 
 portal_router = APIRouter()
 
@@ -63,3 +63,6 @@ portal_router.include_router(mcp.router, prefix="/mcp", tags=["MCP管理"], depe
 
 # 16. 变更日志 (Changelog)
 portal_router.include_router(changelog.router, prefix="/changelog", tags=["变更日志"], dependencies=[Depends(require_api_key)])
+
+# 17. 智能体技能管理 (Skills Management)
+portal_router.include_router(skills.router, prefix="/skills", tags=["技能管理"], dependencies=[Depends(require_api_key)])
