@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from app.core.dependencies import require_admin, require_api_key
 
-from app.api.portal.endpoints import auth, audit, management, roles, changelog, dashboard, agents, chat, chat_feedback, chatbi_examples, metadata, system, keys, prompts, slash_commands, health, models, tools, ragflow
+from app.api.portal.endpoints import auth, audit, management, roles, changelog, dashboard, agents, chat, chat_feedback, chatbi_examples, metadata, system, keys, prompts, slash_commands, health, models, tools, ragflow, mcp
 
 portal_router = APIRouter()
 
@@ -56,6 +56,9 @@ portal_router.include_router(tools.router, prefix="/tools", tags=["工具管理"
 
 # 14. RAGFlow 代理 (RAGFlow Proxy)
 portal_router.include_router(ragflow.router, prefix="/ragflow", tags=["RAGFlow代理"], dependencies=[Depends(require_api_key)])
+
+# 15. MCP 管理 (MCP Management)
+portal_router.include_router(mcp.router, prefix="/mcp", tags=["MCP管理"], dependencies=[Depends(require_api_key)])
 
 
 # 16. 变更日志 (Changelog)

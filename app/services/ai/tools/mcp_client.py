@@ -1,0 +1,290 @@
+import json
+import logging
+import asyncio
+import time
+import uuid
+from typing import Dict, Any, List, Optional, Tuple
+import httpx
+from mcp import ClientSession, types
+from mcp.client.sse import sse_client
+from app.core.orm import AsyncSessionLocal
+from app.models.mcp import McpServer, McpToolCache
+from sqlalchemy import select, update
+
+logger = logging.getLogger(__name__)
+
+class McpSseSession:
+    """
+    MCP 会话管理器
+    管理 MCP 会话，包括连接、请求、响应等。
+    """
+    def __init__(self, server_id: str, sse_url: str, auth_headers: Optional[Dict] = None):
+        self.server_id = server_id
+        self.sse_url = sse_url
+        self.auth_headers = auth_headers or {}
+        self.session: Optional[ClientSession] = None
+        self.last_used_at = time.time()
+        self._lock = asyncio.Lock()
+        self._exit_stack = None
+        self.is_direct_http = False 
+        self.mcp_session_id: Optional[str] = None
+        self._rpc_id_counter = 1
+
+    def next_rpc_id(self) -> int:
+        self._rpc_id_counter += 1
+        return self._rpc_id_counter
+
+    async def connect(self):
+        """建立连接"""
+        async with self._lock:
+            if self.session or self.mcp_session_id:
+                return
+            
+            # Debug: Log header keys
+            header_keys = list(self.auth_headers.keys())
+            logger.info(f"[MCP] Connecting to {self.server_id} at {self.sse_url}. Headers keys present: {header_keys}")
+            if "Authorization" in self.auth_headers:
+                logger.info(f"[MCP] Auth Value (first 10 chars): {self.auth_headers['Authorization'][:10]}...")
+
+            try:
+                from contextlib import AsyncExitStack
+                self._exit_stack = AsyncExitStack()
+
+                # 1. 建立标准 SSE 连接
+                try:
+                    async def _connect_sse():
+                        read_stream, write_stream = await self._exit_stack.enter_async_context(
+                            sse_client(url=self.sse_url, headers=self.auth_headers)
+                        )
+                        self.session = await self._exit_stack.enter_async_context(
+                            ClientSession(read_stream, write_stream)
+                        )
+                        await self.session.initialize()
+
+                    await asyncio.wait_for(_connect_sse(), timeout=10.0)
+                    
+                    self.last_used_at = time.time()
+                    self.is_direct_http = False
+                    logger.info(f"[MCP] Standard SSE initialized for {self.server_id}")
+                    return
+                except Exception as e:
+                    logger.error(f"[MCP] Standard SSE failed for {self.server_id}. Error: {str(sse_err)}", exc_info=True)
+                    await self._exit_stack.aclose()
+                    self._exit_stack = AsyncExitStack()
+                
+                # 2. Fallbck: 使用 HTTP 直连
+                self.is_direct_http = True
+                logger.info(f"[MCP] Switched to Direct HTTP mode for {self.server_id}")
+                self.last_used_at = time.time()
+
+            except Exception as e:
+                logger.error(f"[MCP] Connection failed for {self.server_id}: {e}", exc_info=True)
+                raise
+
+    async def close(self):
+        """Closes the connection"""
+        async with self._lock:
+            if self._exit_stack:
+                await self._exit_stack.aclose()
+            self.session = None
+            self.mcp_session_id = None
+            logger.info(f"[MCP] Session closed for {self.server_id}")
+
+    def update_activity(self):
+        self.last_used_at = time.time()
+
+class McpClientService:
+    """
+    MCP 客户端服务
+    管理 MCP 客户端会话，包括连接、请求、响应等。
+    """
+    _sessions: Dict[str, McpSseSession] = {}
+    _cleanup_task: Optional[asyncio.Task] = None
+
+    @classmethod
+    async def get_session(cls, server_id: str) -> McpSseSession:
+        """获取会话"""
+        if not cls._cleanup_task:
+            cls._cleanup_task = asyncio.create_task(cls._idle_cleanup_loop())
+
+        if server_id not in cls._sessions:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(select(McpServer).where(McpServer.id == server_id))
+                server = result.scalar_one_or_none()
+                if not server: raise ValueError(f"MCP Server {server_id} not found")
+                headers = json.loads(server.auth_headers) if server.auth_headers else {}
+                cls._sessions[server_id] = McpSseSession(server_id, server.sse_url, headers)
+
+        session = cls._sessions[server_id]
+        await session.connect()
+        session.update_activity()
+        return session
+
+    @classmethod
+    async def list_remote_tools(cls, server_id: str) -> List[Any]:
+        """获取远程工具列表"""
+        session_mgr = await cls.get_session(server_id)
+
+        if not session_mgr.is_direct_http:
+            response = await session_mgr.session.list_tools()
+            return response.tools
+        else:
+            # 直连 HTTP： 1. 初始 -> 2. 初始化 -> 3. list
+            if not session_mgr.mcp_session_id:
+                await cls._direct_http_rpc(session_mgr, "initialize", {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "clientInfo": {"name": "yunshu-ai-agent", "version": "1.0.0"}
+                })
+                await cls._direct_http_rpc(session_mgr, "notifications/initialized", {}, is_notification=True)
+
+            res = await cls._direct_http_rpc(session_mgr, "tools/list", {})
+            if isinstance(res, dict) and "tools" in res: return res["tools"]
+            elif isinstance(res, list): return res
+            return []
+
+    @classmethod
+    async def call_remote_tool(cls, server_id: str, too_name: str, arguments: Dict[str, Any]) -> str:
+        """调用远程工具"""
+        session_mgr = await cls.get_session(server_id)
+
+        if not session_mgr.is_direct_http:
+            try:
+                response = await session_mgr.session.call_tool(too_name, arguments)
+                return "".join([getattr(item, 'text', '') for item in response.content])
+            except Exception as e:
+                await session_mgr.close()
+                return f"[MCP Error] {e}"
+        else:
+            if not session_mgr.mcp_session_id:
+                await cls._direct_http_rpc(session_mgr, "initialize", {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "clientInfo": {"name": "yunshu", "version": "1.0.0"}
+                })
+                await cls._direct_http_rpc(session_mgr, "notifications/initialized", {}, is_notification=True)
+
+            res = await cls._direct_http_rpc(session_mgr, "tools/call", {
+                "name": tool_name,
+                "arguments": arguments
+            })
+            if isinstance(res, dict) and "content" in res:
+                return "".join([c.get("text", "") for c in res["content"] if c.get("type") == "text"])
+            return str(res)
+
+    @classmethod
+    async def _direct_http_rpc(cls, session_mgr: McpSseSession, method: str, params: Optional[Dict], is_notification: bool = False, retry_count: int = 0) -> Any:
+        """直连HTTP"""
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            **session_mgr.auth_headers
+        }
+        if session_mgr.mcp_session_id:
+            headers["mcp-session-id"] = session_mgr.mcp_session_id
+
+        rpc_id = session_mgr.next_rpc_id() if not is_notification else None
+        payload = { "jsonrpc": "2.0", "method": method, "params": params or {} }
+        if rpc_id is not None:
+            payload["id"] = rpc_id
+
+        logger.debug(f"[MCP-Direct] Request: {method} to {session_mgr.sse_url} | RPC ID: {rpc_id} | Headers keys: {list(headers.keys())}")
+        if "Authorization" in headers:
+             logger.info(f"[MCP-Direct] Sending Authorization: {headers['Authorization'][:15]}...")
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                resp = await client.post(session_mgr.sse_url, json=payload, headers=headers)
+                logger.info(f"[MCP-Direct] Response from {method}: HTTP {resp.status_code}")
+            except Exception as http_err:
+                logger.error(f"[MCP-Direct] HTTP Request failed for {method}: {http_err}")
+                raise
+            
+            # Capture Session ID from initialization
+            if method == "initialize" and resp.status_code == 200:
+                s_id = resp.headers.get("mcp-session-id")
+                if not s_id:
+                    try:
+                        res_data = resp.json().get("result", {})
+                        s_id = res_data.get("_experimental", {}).get("session_id") or res_data.get("session_id")
+                    except:
+                        pass
+                if s_id: 
+                    session_mgr.mcp_session_id = s_id
+                    logger.info(f"[MCP-Direct] Captured Session ID: {s_id}")
+
+            # Accept all 2xx codes (200, 201, 202, 204)
+            if 200 <= resp.status_code < 300:
+                if resp.status_code == 204 or not resp.text:
+                    return None
+                
+                try:
+                    data = resp.json()
+                    if "result" in data: return data["result"]
+                    if is_notification: return None
+                    if "error" in data:
+                        logger.error(f"[MCP-Direct] RPC Error Response: {data['error']}")
+                        raise Exception(f"RPC Error {data['error'].get('code')}: {data['error'].get('message')}")
+                    return data
+                except json.JSONDecodeError:
+                    logger.warning(f"[MCP-Direct] Non-JSON success response: {resp.text[:200]}")
+                    return None # Success but not JSON (e.g. 202 Accepted)
+            
+            # Handle Session Expired (401)
+            if resp.status_code == 401:
+                try:
+                    err_data = resp.json()
+                    # Check for SessionExpired (Case insensitive check for safety)
+                    err_code = err_data.get("Code", "")
+                    if err_code == "SessionExpired":
+                        if retry_count < 1:
+                            logger.warning(f"[MCP-Direct] Session Expired for {session_mgr.server_id}. Clearing session and retrying...")
+                            session_mgr.mcp_session_id = None
+                            # Recursive retry
+                            return await cls._direct_http_rpc(session_mgr, method, params, is_notification, retry_count=retry_count + 1)
+                        else:
+                            logger.error(f"[MCP-Direct] Session Expired and retry limit reached.")
+                except Exception as e:
+                    logger.warning(f"[MCP-Direct] Failed to parse error response for retry check: {e}")
+
+            logger.error(f"[MCP-Direct] Error Response Body: {resp.text[:500]}")
+            raise Exception(f"HTTP {resp.status_code}: {resp.text}")
+
+    @classmethod
+    async def sync_tool(cls, server_id: str):
+        """同步工具"""
+        tools = await cls.list_remote_tools(server_id)
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(McpServer).where(McpServer.id == server_id))
+            server = result.scalar_one_or_none()
+            if not server: return
+            from datetime import datetime
+            server.enabled_status = 1
+            server.last_sync_at = datetime.now()
+            for t in tools:
+                t_name = t.name if hasattr(t, 'name') else t.get('name')
+                t_desc = t.description if hasattr(t, 'description') else t.get('description')
+                t_schema = t.inputSchema if hasattr(t, 'inputSchema') else t.get('inputSchema', t.get('parameter_schema'))
+                full_name = f"{server.server_name}:{t_name}"
+                stmt = select(McpToolCache).where(McpToolCache.server_id == server_id, McpToolCache.tool_name == full_name)
+                existing = (await db.execute(stmt)).scalar_one_or_none()
+                if existing:
+                    existing.tool_description = t_desc
+                    existing.parameter_schema = json.dumps(t_schema)
+                else:
+                    db.add(McpToolCache(id=str(uuid.uuid4()), server_id=server_id, tool_name=full_name, tool_description=t_desc, parameter_schema=json.dumps(t_schema), is_published=False))
+            await db.commit()
+
+    @classmethod
+    async def _idle_cleanup_loop(cls):
+        while True:
+            await asyncio.sleep(60)
+            now = time.time()
+            for sid, session in cls._sessions.items():
+                if (session.session or session.mcp_session_id) and (now - session.last_used_at > 300):
+                    await session.close()
+
+    @classmethod
+    async def shutdown(cls):
+        if cls._cleanup_task: cls._cleanup_task.cancel()
+        for session in cls._sessions.values(): await session.close()
