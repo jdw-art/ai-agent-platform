@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from app.core.dependencies import require_admin, require_api_key
 
-from app.api.portal.endpoints import auth, audit, management, roles, changelog, dashboard, agents, chat, chat_feedback, chatbi_examples, metadata, system, keys, prompts, slash_commands, health, models, tools, ragflow, mcp, skills
+from app.api.portal.endpoints import auth, audit, management, roles, changelog, dashboard, agents, chat, chat_feedback, chatbi_examples, metadata, system, keys, prompts, slash_commands, health, models, tools, ragflow, mcp, skills, memory
 
 portal_router = APIRouter()
 
@@ -66,3 +66,6 @@ portal_router.include_router(changelog.router, prefix="/changelog", tags=["变�
 
 # 17. 智能体技能管理 (Skills Management)
 portal_router.include_router(skills.router, prefix="/skills", tags=["技能管理"], dependencies=[Depends(require_api_key)])
+
+# 18. 记忆管理中心 (Memory Management)
+portal_router.include_router(memory.router, prefix="/memory", tags=["记忆管理"], dependencies=[Depends(require_api_key)])
