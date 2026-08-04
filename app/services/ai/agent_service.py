@@ -1,3 +1,5 @@
+"""Agent 服务编排主业务逻辑"""
+
 import json
 import logging
 import time
@@ -34,10 +36,1230 @@ def _accumulate_stream_content(full: str, chunk: Dict[str, Any]) -> str:
 
 class AgentService:
     """
-    用于 AI 代理交互的统一编排器。 
+    用于 AI 代理交互的统一编排器。
     现在重构为将执行委托给专门的执行器。
     """
 
     async def generate_greesting(self) -> str:
         """生成欢迎语"""
         return AgentServicePrompts.GREETING
+
+    async def _build_user_context_msg(self, user_info: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Builds a system message that introduces the user to the AI with etiquette guidelines.
+        """
+        # Strictly use English Account Name per user request
+        raw_name = user_info.get("user_name") or user_info.get("username", "Unknown User")
+        dept = user_info.get("dept_name") or user_info.get("department")
+        role = user_info.get("role_name") or user_info.get("role")
+
+        content = AgentServicePrompts.user_context_message(raw_name, dept, role)
+        return {"role": "system", "content": content}
+
+    async def chat_completion_stream(
+        self,
+        messages: List[Dict[str, str]],
+        agent_id: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        version_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        user_info: Optional[Dict[str, Any]] = None,
+        api_key: Optional[str] = None,
+        enable_multi_agent: bool = True,
+        debug_options: Optional[Dict[str, Any]] = None,
+        permission_options: Optional[Dict[str, Any]] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        发送对话请求，支持流式响应。
+        """
+        trace_id = str(uuid.uuid4())
+        trace_buffer: List[AgentExecutionStep] = []
+        agent_config = None
+
+        # 1. 初始身份块
+        yield {"trace_id": trace_id, "status": "init"}
+
+        full_response_content = ""
+
+        # --- Memory Integration ---
+        # 如果提供了 conversation_id，我们将使用服务器端历史记录。
+        if conversation_id:
+            u_id = user_info.get("user_id") if user_info else None
+            server_history = await memory_service.get_history(u_id, conversation_id)
+            # 当前 message 中最可能包含用户的 prompt
+            # 但如果是后续消息，我们应该小心，只获取最后一条用户消息
+            user_msg = messages[-1] if messages else None
+
+            if user_msg and user_msg.get("role") == "user":
+                # 保存用户消息到 memory
+                asyncio.create_task(memory_service.add_message(
+                    u_id,
+                    conversation_id,
+                    "user",
+                    user_msg["content"],
+                    files=user_msg.get("files")
+                ))
+
+                # --- Context Window Optimization ---
+                # 我们限制发送到LLM的历史消息数量以保存令牌
+                # 但将完整的 100 保留在 Redis 中以供 UI 显示。
+                from app.services.config_service import ConfigService
+                max_context = await ConfigService.get("agent_max_context_messages", "20")
+                try:
+                    max_context = int(max_context)
+                except ValueError:
+                    max_context = 20
+
+                context_history = server_history[-max_context:] if server_history else []
+                # 结合历史消息和当前消息
+                messages = context_history + [user_msg]
+            else:
+                # 如果用户消息不在请求中，只获取会话历史
+                # 同时使用 limit 限制消息数量，避免超出最大上下文长度
+                from app.services.config_service import ConfigService
+                max_context = await ConfigService.get("agent_max_context_messages", "20")
+                try:
+                    max_context = int(max_context)
+                except ValueError:
+                    max_context = 20
+                messages = server_history[-max_context:] if server_history else []
+
+        from app.utils.skill_metadata import enrich_messages_with_skill_meta
+
+        enrich_messages_with_skill_meta(messages)
+
+        user_query = messages[-1]["content"] if messages else ""
+
+        # --- Handle explicit @mention in text ---
+        import re
+        if user_query and not (agent_id or agent_name):
+            mention_match = re.match(r'^[@＠]([^\s]+)\s+(.*)$', user_query, re.DOTALL)
+            if mention_match:
+                agent_name = mention_match.group(1)
+                user_query = mention_match.group(2).strip()
+                if messages:
+                    messages[-1]["content"] = user_query
+                logger.info(f"Intercepted explicit @mention, routing directly to agent: {agent_name}")
+
+        execution_status = "success"
+        start_time = asyncio.get_running_loop().time()
+
+        if not messages:
+            yield {"content": AgentServicePrompts.EMPTY_REQUEST}
+            return
+
+        try:
+            # 2. 准备上下文
+            route_start = asyncio.get_running_loop().time()
+            agent_config, route_details = await AgentContextManager.resolve_agent_config(
+                messages,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                version_id=version_id,
+                enable_multi_agent=enable_multi_agent,
+                user_info=user_info,
+            )
+            route_elapsed_ms = (asyncio.get_running_loop().time() - route_start) * 1000
+
+            if not agent_config:
+                yield {"content": AgentServicePrompts.NO_AGENT_CONFIG}
+                return
+
+            route_hints = None
+            # 提交路由逻辑
+            if route_details:
+                logger.info(f"[Router] Routing decision found: {route_details}")
+                # 提取字段
+                r_thought = getattr(route_details, "reasoning", "No reasoning")
+                r_conf = getattr(route_details, "confidence", 0.0)
+                r_agent = getattr(route_details, "agent_id", "unknown")
+                r_turn_labels = getattr(route_details, "turn_labels", []) or []
+                r_relation = getattr(route_details, "relation_to_previous", "unknown")
+                r_action_type = getattr(route_details, "user_action_type", "unknown")
+                route_hints = {
+                    "turn_labels": r_turn_labels,
+                    "relation_to_previous": r_relation,
+                    "user_action_type": r_action_type,
+                }
+
+                # 1. 实时 SSE 事件
+                yield {
+                    "type": "router_log",
+                    "thought": r_thought,
+                    "confidence": r_conf,
+                    "selected_agent": r_agent,
+                    "turn_labels": r_turn_labels,
+                    "relation_to_previous": r_relation,
+                    "user_action_type": r_action_type,
+                    "status": "success",
+                    "execution_time_ms": route_elapsed_ms
+                }
+
+                # 2. 持久化 Trace 记录
+                from app.services.config_service import ConfigService
+                router_model = await ConfigService.get("llm_model_name") or "gpt-5.5"
+
+                trace_buffer.append(AgentExecutionStep(
+                    step_number=0,
+                    event_type="router",
+                    agent_name="Smart Router",
+                    model=router_model,
+                    tool_name="route_query",
+                    tool_input={"query": user_query},
+                    tool_output={
+                        "thought": r_thought,
+                        "selected_agent": r_agent,
+                        "confidence": r_conf,
+                        "turn_labels": r_turn_labels,
+                        "relation_to_previous": r_relation,
+                        "user_action_type": r_action_type,
+                    },
+                    status="success",
+                    execution_time_ms=route_elapsed_ms
+                ))
+            else:
+                logger.info("[Router] No routing details (direct agent selection or fallback)")
+
+            # 权限检查
+            if user_info:
+                # 1. Determine Identity
+                u_role = user_info.get("role", "")
+                u_id = user_info.get("user_id", user_info.get("id"))
+
+                # 2. Check (Skip for Admin)
+                if u_role != "admin" and u_id:
+                    from app.services.permission_service import PermissionService
+                    async with AsyncSessionLocal() as session:
+                        perm_service = PermissionService(session)
+                        # Ensure ID is string for check
+                        agent_id_str = str(agent_config.agent_id)
+                        has_perm = await perm_service.check_permission(int(u_id), "agent", agent_id_str)
+
+                        if not has_perm:
+                            err_msg = AgentServicePrompts.permission_denied(agent_config.agent_name)
+                            yield {"content": err_msg}
+                            execution_status = "denied"
+                            return
+
+            # 3. Setup Context (Inject user info & api_key for permission checks)
+            await AgentContextManager.setup_context(
+                config=agent_config,
+                debug_options=debug_options,
+                user_info=user_info,
+                api_key=api_key,
+                conversation_id=conversation_id,
+            )
+
+            # --- Active Skill Injection ---
+            active_skills = []
+            if messages and "files" in messages[-1] and messages[-1]["files"]:
+                for file_obj in messages[-1]["files"]:
+                    if file_obj.get("type") == "skill":
+                        active_skills.append(file_obj)
+
+            mounted_skill_ids = {s.get("url") for s in active_skills if s.get("url")}
+            skills_injection = []
+
+            if active_skills:
+                import os
+                from app.core.config import settings
+                from app.utils.skill_metadata import parse_skill_frontmatter
+
+                for skill_obj in active_skills:
+                    skill_id = skill_obj.get("url")
+                    if not skill_id:
+                        continue
+                    skill_md_path = os.path.join(settings.SKILLS_DIR, skill_id, "SKILL.md")
+                    meta_override = skill_obj.get("skillMeta") or skill_obj.get("skill_meta")
+                    if meta_override and isinstance(meta_override, dict):
+                        skill_name = str(meta_override.get("name") or skill_id)
+                        description = str(meta_override.get("description") or "")
+                    elif os.path.exists(skill_md_path):
+                        meta = parse_skill_frontmatter(skill_id, skill_md_path)
+                        skill_name = meta.get("name") or skill_obj.get("filename", skill_id).replace(" (技能)", "")
+                        description = meta.get("description") or ""
+                    else:
+                        skill_name = skill_obj.get("filename", skill_id).replace(" (技能)", "")
+                        description = ""
+                        logger.warning("[Skills] Skill markdown not found at %s", skill_md_path)
+
+                    skills_injection.append(
+                        AgentServicePrompts.skill_summary_injection_block(
+                            skill_name, skill_id, description
+                        )
+                    )
+                    logger.info("[Skills] Matched mounted skill %s (summary only).", skill_id)
+
+            # 用户口头指定「使用 XX 技能」但未在输入框挂载时，按 name/id 自动解析并注入摘要。
+            if user_query:
+                try:
+                    from app.services.ai.skill_resolver import resolve_skills_from_query
+
+                    for skill_meta in resolve_skills_from_query(user_query):
+                        skill_id = skill_meta.get("id")
+                        if not skill_id or skill_id in mounted_skill_ids:
+                            continue
+                        skill_name = skill_meta.get("name") or skill_id
+                        description = skill_meta.get("description") or ""
+                        skills_injection.append(
+                            AgentServicePrompts.skill_summary_injection_block(
+                                skill_name, skill_id, description
+                            )
+                        )
+                        mounted_skill_ids.add(skill_id)
+                        logger.info("[Skills] Auto-resolved skill %s from query (summary only).", skill_id)
+                        yield {
+                            "type": "log",
+                            "id": f"skill_load_{skill_id}",
+                            "title": f"已匹配技能: {skill_name}",
+                            "details": (
+                                f"已从技能库匹配「{skill_name}」(ID: {skill_id})。"
+                                f"已注入摘要；模型须调用 read_skill_instruction 读取 SKILL.md 全文后再执行。"
+                            ),
+                            "status": "success",
+                        }
+                except Exception as resolve_err:
+                    logger.warning("[Skills] Failed to auto-resolve skills from query: %s", resolve_err)
+
+            if skills_injection:
+                # 限制最大技能预载摘要数，防止 token 爆炸（Lost in the Middle 优化）
+                MAX_PRELOAD_SKILLS = 5
+                if len(skills_injection) > MAX_PRELOAD_SKILLS:
+                    logger.info(f"[Skills] Too many skills ({len(skills_injection)}), truncating to top {MAX_PRELOAD_SKILLS}")
+                    skills_injection = skills_injection[:MAX_PRELOAD_SKILLS]
+                    skills_injection.append(
+                        "=== [已截断] 系统中已挂载或解析出更多可用技能，出于上下文性能优化，其余技能摘要未全部载入。如有需要，模型应通过调用 list_available_skills 工具获取其余技能详细摘要 ==="
+                    )
+                skills_profile = AgentServicePrompts.skills_profile(skills_injection)
+                if agent_config.system_prompt:
+                    agent_config.system_prompt = f"{skills_profile}\n\n{agent_config.system_prompt}"
+                else:
+                    agent_config.system_prompt = skills_profile
+
+            # --- Global Skill Discovery Hint（已有挂载/解析技能时省略，减少 prompt 噪声）---
+            skills_already_loaded = bool(skills_injection) or bool(mounted_skill_ids)
+            if not skills_already_loaded:
+                try:
+                    from app.core.config import settings
+
+                    skills_dir = settings.SKILLS_DIR
+                    skill_discovery_hint = AgentServicePrompts.skill_discovery_hint(skills_dir)
+                    if agent_config.system_prompt:
+                        agent_config.system_prompt = f"{skill_discovery_hint}\n\n{agent_config.system_prompt}"
+                    else:
+                        agent_config.system_prompt = skill_discovery_hint
+                except Exception as skill_hint_err:
+                    logger.warning("[Skills] Failed to inject skill discovery hint: %s", skill_hint_err)
+
+            # --- 按轮次类型裁剪上下文注入（与会话级 Turn 分类共用，不重复调意图 LLM）---
+            from app.services.ai.turn_classifier import (
+                TurnType,
+                resolve_turn_for_session,
+                should_inject_ltm,
+                should_inject_memory_recall_hint,
+                should_inject_user_context,
+                should_run_active_memory_preload,
+                turn_type_label,
+                default_thought_expanded,
+            )
+
+            can_do_data = "data_query" in (agent_config.capabilities or [])
+            if can_do_data:
+                turn_classification, turn_intent_info, turn_intent_elapsed_ms = await resolve_turn_for_session(
+                    user_query,
+                    messages,
+                    can_do_data=True,
+                    user_info=user_info,
+                    conversation_id=conversation_id,
+                )
+                session_turn = (turn_classification, turn_intent_info, turn_intent_elapsed_ms)
+            else:
+                turn_classification, turn_intent_info, turn_intent_elapsed_ms = await resolve_turn_for_session(
+                    user_query,
+                    messages,
+                    can_do_data=False,
+                    user_info=user_info,
+                    conversation_id=conversation_id,
+                )
+                session_turn = (turn_classification, turn_intent_info, turn_intent_elapsed_ms)
+            early_turn_type = turn_classification.turn_type
+            if can_do_data and turn_classification.turn_type == TurnType.DATA_QUERY_REQUEST:
+                turn_display_label = "ChatBI 请求类别分析"
+            else:
+                turn_display_label = turn_type_label(turn_classification.turn_type)
+
+            # --- Long-Term Memory (LTM) Injection ---
+            if should_inject_ltm(early_turn_type) and user_info:
+                u_id = user_info.get("user_id", user_info.get("id"))
+                if u_id:
+                    try:
+                        from app.services.ai.memory_service import ltm_service
+                        # 200 ms 极短超时控制防网络延迟
+                        ltm_data = await asyncio.wait_for(ltm_service.fetch_memory(str(u_id)), timeout=0.2)
+                        if ltm_data:
+                            import json
+                            ltm_formatted = json.dumps(ltm_data, ensure_ascii=False, indent=2)
+                            memory_profile = AgentServicePrompts.ltm_memory_profile(ltm_formatted)
+                            if agent_config.system_prompt:
+                                agent_config.system_prompt = f"{memory_profile}\n\n{agent_config.system_prompt}"
+                            else:
+                                agent_config.system_prompt = memory_profile
+                            logger.info(f"[LTM] Successfully injected memory profile into System Prompt for user {u_id}")
+                    except Exception as ltm_err:
+                        logger.warning(f"[LTM] Failed to inject long-term memory for user {u_id}: {ltm_err}")
+
+            # --- Cross-session memory recall hint (memory_search tool) ---
+            if should_inject_memory_recall_hint(early_turn_type):
+                try:
+                    from app.services.memory_config_service import MemoryConfigService
+                    from app.services.ai.memory_recall_policy import CROSS_SESSION_MEMORY_SYSTEM_HINT
+
+                    if await MemoryConfigService.get_bool("memory_service_enabled", True):
+                        if agent_config.system_prompt:
+                            agent_config.system_prompt = (
+                                f"{CROSS_SESSION_MEMORY_SYSTEM_HINT}\n\n{agent_config.system_prompt}"
+                            )
+                        else:
+                            agent_config.system_prompt = CROSS_SESSION_MEMORY_SYSTEM_HINT
+                except Exception as mem_hint_err:
+                    logger.warning("[Memory] Failed to inject cross-session recall hint: %s", mem_hint_err)
+
+            # --- Dynamic Auto-Memory Ingest (Active Memory) ---
+            if should_run_active_memory_preload(early_turn_type) and user_info and user_query:
+                u_id = user_info.get("user_id", user_info.get("id"))
+                if u_id:
+                    try:
+                        from app.services.memory_config_service import MemoryConfigService
+                        if await MemoryConfigService.get_bool("memory_service_enabled", True):
+                            from app.services.ai.tools.memory_search_tool import parse_date_from_query
+                            from app.services.ai.daily_summary_service import DailySummaryService
+                            from app.services.ai.memory_index_service import MemoryIndexService
+
+                            uid = str(u_id)
+                            target_day = parse_date_from_query(user_query)
+
+                            preloaded_memories = []
+
+                            # 1. 相对/绝对日期精确匹配
+                            if target_day:
+                                # a. 每日摘要
+                                d_summary = await DailySummaryService.get_daily_summary(uid, target_day)
+                                if d_summary:
+                                    preloaded_memories.append(
+                                        AgentServicePrompts.daily_summary_section(target_day, d_summary)
+                                    )
+                                # b. 当天发生的具体会话摘要
+                                d_sessions = await MemoryIndexService.list_session_summaries_for_day(uid, target_day)
+                                if d_sessions:
+                                    sess_lines = []
+                                    for idx, s in enumerate(d_sessions, 1):
+                                        sess_lines.append(
+                                            AgentServicePrompts.session_summary_line(idx, s)
+                                        )
+                                    preloaded_memories.append(
+                                        AgentServicePrompts.day_session_records(target_day, sess_lines)
+                                    )
+
+                            # 2. 模糊历史回忆意图匹配
+                            else:
+                                is_recall_intent = any(w in user_query for w in AgentServicePrompts.RECALL_INTENT_KEYWORDS)
+                                if is_recall_intent:
+                                    recent_sessions = await MemoryIndexService.list_summaries(uid, limit=3)
+                                    if recent_sessions:
+                                        sess_lines = []
+                                        for idx, s in enumerate(recent_sessions, 1):
+                                            sess_lines.append(
+                                                AgentServicePrompts.session_summary_line(idx, s)
+                                            )
+                                        preloaded_memories.append(
+                                            AgentServicePrompts.recent_sessions_section(sess_lines)
+                                        )
+
+                            # 3. 拼接注入 System Prompt 头部
+                            if preloaded_memories:
+                                memory_preloaded_str = AgentServicePrompts.preloaded_memories(preloaded_memories)
+                                if agent_config.system_prompt:
+                                    agent_config.system_prompt = f"{memory_preloaded_str}\n\n{agent_config.system_prompt}"
+                                else:
+                                    agent_config.system_prompt = memory_preloaded_str
+                                logger.info(f"[ActiveMemory] Successfully preloaded memory context for user {u_id}")
+                    except Exception as recall_err:
+                        logger.warning(f"[ActiveMemory] Failed to preload memory context: {recall_err}", exc_info=True)
+
+            # --- User Identity Injection（查数轮次可省略以减 prompt 噪声）---
+            if should_inject_user_context(early_turn_type) and user_info:
+                id_msg = await self._build_user_context_msg(user_info)
+                messages.insert(0, id_msg)
+
+            # --- 平台全局 System Prompt（置于 system_prompt 栈最顶；仅 LOCAL 引擎）---
+            if (agent_config.engine_type or "LOCAL") == "LOCAL":
+                agent_config.system_prompt = AgentServicePrompts.prepend_platform_global_system_prompt(
+                    agent_config.system_prompt,
+                    agent_config=agent_config
+                )
+
+            # --- Debug Overrides ---
+            if debug_options:
+                # 1. System Prompt Override
+                if debug_options.get("system_prompt_override"):
+                    logger.info(f"[Debug] Overriding System Prompt for Trace {trace_id}")
+                    agent_config.system_prompt = debug_options["system_prompt_override"]
+                    yield {
+                        "type": "log",
+                        "title": "Debug: Prompt Override",
+                        "details": "System Prompt 已被调试配置临时覆盖",
+                        "status": "success",
+                        "isDebug": True
+                    }
+
+                # 2. Context Injection
+                if debug_options.get("injected_context"):
+                    context_data = debug_options["injected_context"]
+                    logger.info(f"[Debug] Injecting Context: {context_data}")
+
+                    # 1. Standard keys
+                    ctx_lines = []
+                    for k, v in context_data.items():
+                        if k not in ["device_type", "display_hint"]:
+                            ctx_lines.append(f"- **{k}**: {v}")
+
+                    # 2. Device & UI Optimization (Actionable Instructions)
+                    device_type = context_data.get("device_type", "Unknown")
+                    display_hint = context_data.get("display_hint", "")
+
+                    ui_instr = ""
+                    if "移动端" in device_type or "小屏幕" in device_type:
+                        ui_instr = AgentServicePrompts.MOBILE_UI_RULES
+                    elif "桌面端" in device_type or "大屏幕" in device_type:
+                        ui_instr = AgentServicePrompts.DESKTOP_UI_RULES
+
+                    context_str = "\n".join(ctx_lines)
+                    injection_msg = {
+                        "role": "system",
+                        "content": AgentServicePrompts.session_runtime_context(context_str, device_type, ui_instr)
+                    }
+                    # Insert after User Identity to allow debug context to potentially refine it
+                    messages.insert(1, injection_msg)
+
+            # --- Raw Prompt Capture (Debug) ---
+            if debug_options and debug_options.get("return_raw_prompt"):
+                raw_messages = []
+                # Reconstruct what would be sent to LLM (simplified approximation)
+                raw_messages.extend(messages)
+
+                # Emit debug event
+                yield {
+                    "type": "debug",
+                    "subtype": "raw_prompt",
+                    "data": raw_messages
+                }
+
+            # Emit Meta Event
+            from app.services.config_service import ConfigService
+            default_model = await ConfigService.get("llm_model_name") or "DeepSeek-V3.2"
+
+            # Determine actual model to use
+            actual_model = agent_config.model_name or default_model
+            if debug_options and debug_options.get("model"):
+                actual_model = debug_options["model"]
+                logger.info(f"[Debug] Overriding Model to: {actual_model}")
+
+            # Update config for downstream use (important for Executors)
+            agent_config.model_name = actual_model
+
+            yield {
+                "type": "meta",
+                "agent_name": agent_config.agent_name,
+                "agent_display_name": agent_config.agent_display_name or agent_config.agent_name,
+                "model": actual_model,
+                "turn_type": turn_classification.turn_type.value,
+                "turn_type_label": turn_display_label,
+                "thought_expanded_default": default_thought_expanded(turn_classification.turn_type),
+            }
+
+            # 3. Execution (Branch: Single vs Multi)
+            secondary_agents = getattr(route_details, "secondary_agents", []) if route_details else []
+
+            if enable_multi_agent and secondary_agents:
+                # --- Multi-Agent Parallel Execution Mode ---
+                async for chunk in self._execute_multi_agent(
+                    agent_config,
+                    secondary_agents,
+                    user_query,
+                    messages,
+                    trace_id,
+                    trace_buffer,
+                    debug_options,
+                    permission_options,
+                    user_info,
+                    api_key,
+                    conversation_id,
+                    session_turn,
+                    route_hints,
+                ):
+                    full_response_content = _accumulate_stream_content(full_response_content, chunk)
+                    yield chunk
+            else:
+                # --- Standard Single Agent Mode ---
+                # Dispatch to Executor
+                executor = await AgentDispatcher.dispatch(
+                    agent_config,
+                    user_query,
+                    messages,
+                    trace_id,
+                    trace_buffer,
+                    debug_options,
+                    permission_options,
+                    user_info,
+                    conversation_id,
+                    shared_turn=session_turn,
+                    route_hints=route_hints,
+                )
+
+                yield {
+                    "type": "log",
+                    "title": "分析用户请求并进行意图识别",
+                    "details": f"{turn_display_label}。{turn_classification.reasoning}",
+                    "status": "success",
+                    "category": "intent",
+                    "turn_type": turn_classification.turn_type.value,
+                    "execution_time_ms": turn_intent_elapsed_ms,
+                }
+
+                # Execution
+                async for chunk in executor.execute(messages):
+                    full_response_content = _accumulate_stream_content(full_response_content, chunk)
+                    if chunk.get("type") == "permission_required":
+                        execution_status = "awaiting_permission"
+                    elif chunk.get("type") == "external_execution_required":
+                        execution_status = "awaiting_external_execution"
+                    elif chunk.get("type") == "error" or chunk.get("status") == "error":
+                        execution_status = "error"
+                    yield chunk
+
+            # 聚合本轮消耗的 Token 并 yield meta 给前端，同时传给 add_message
+            p_tokens, c_tokens, t_tokens = 0, 0, 0
+            try:
+                from app.services.ai.audit import aggregate_tokens_from_trace_buffer
+                p_tokens, c_tokens, t_tokens = aggregate_tokens_from_trace_buffer(trace_buffer) if trace_buffer else (0, 0, 0)
+            except Exception as agg_err:
+                logger.warning(f"Failed to aggregate tokens for session: {agg_err}")
+
+            if p_tokens or c_tokens:
+                yield {
+                    "type": "meta",
+                    "prompt_tokens": p_tokens,
+                    "completion_tokens": c_tokens,
+                    "total_tokens": t_tokens
+                }
+
+            # 5. Save Assistant Response to Memory
+            if conversation_id and full_response_content:
+                u_id = user_info.get("user_id") if user_info else None
+                # 记录处理本轮的智能体 name(slug)，供下一轮路由做会话粘性
+                handled_by = getattr(agent_config, "agent_name", None) if agent_config else None
+                asyncio.create_task(memory_service.add_message(
+                    u_id,
+                    conversation_id,
+                    "assistant",
+                    full_response_content,
+                    trace_id=trace_id,
+                    agent_name=handled_by,
+                    prompt_tokens=p_tokens,
+                    completion_tokens=c_tokens
+                ))
+
+        except Exception as e:
+            logger.error(f"Execution Error: {str(e)}", exc_info=True)
+            execution_status = "error"
+            from app.services.ai.multimodal_support import format_execution_error
+
+            model_name = getattr(agent_config, "model_name", None) if agent_config else None
+            yield {
+                "content": format_execution_error(str(e), model_name=model_name),
+                "status": "error",
+            }
+
+        finally:
+            end_time = asyncio.get_running_loop().time()
+            duration = (end_time - start_time) * 1000
+
+            # 6. Async Audit Logging & History
+            if execution_status not in AWAITING_RESUME_STATUSES:
+                asyncio.create_task(AuditManager.log_transaction(
+                     trace_id, agent_config, user_query, full_response_content,
+                     user_info, execution_status, duration, trace_buffer,
+                     conversation_id=conversation_id
+                ))
+
+            if (
+                conversation_id
+                and execution_status == "success"
+                and full_response_content
+                and user_info
+                and user_info.get("user_id")
+            ):
+                from app.services.ai.session_summary_service import SessionSummaryService
+                u_id = user_info.get("user_id")
+                asyncio.create_task(
+                    SessionSummaryService.merge_session_summary(
+                        str(u_id), conversation_id, full_response_content
+                    )
+                )
+
+    async def chat_completion(
+        self,
+        messages: List[Dict[str, str]],
+        agent_id: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        version_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        user_info: Optional[Dict[str, Any]] = None,
+        api_key: Optional[str] = None,
+        enable_multi_agent: bool = True,
+        permission_options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        用于聊天内容自动补全的非流式封装。
+        它会接收聊天流并返回最终结果。
+        """
+        full_content = ""
+        trace_id = ""
+        agent_name_resp = ""
+
+        async for chunk in self.chat_completion_stream(
+            messages,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            version_id=version_id,
+            conversation_id=conversation_id,
+            user_info=user_info,
+            api_key=api_key,
+            enable_multi_agent=enable_multi_agent,
+            permission_options=permission_options,
+        ):
+            if "trace_id" in chunk and chunk.get("status") == "init":
+                trace_id = chunk["trace_id"]
+            if "content" in chunk:
+                full_content += chunk["content"]
+            if "agent_name" in chunk:
+                agent_name_resp = chunk["agent_name"]
+
+        return {
+            "content": full_content,
+            "intent": "general_chat", # Simplified, real intent is in stream but not easily exposed here without refactor
+            "trace_id": trace_id,
+            "agent_name": agent_name_resp
+        }
+
+    async def resume_agentscope_permission_stream(
+        self,
+        *,
+        permission_request_id: str,
+        confirmed: bool,
+        user_info: Optional[Dict[str, Any]] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        用于恢复工具确认请求的流式封装。
+        它会接收工具确认请求 ID、确认状态和用户信息，返回恢复结果。
+        """
+        from app.services.ai.runtime.agentscope.confirmations import (
+            pending_agentscope_confirmations,
+        )
+
+        current_user_id = None
+        if user_info:
+            current_user_id = user_info.get("user_id") or user_info.get("id")
+
+        pending = await pending_agentscope_confirmations.pop_async(
+            permission_request_id,
+            user_id=current_user_id,
+        )
+        if not pending:
+            yield {
+                "type": "error",
+                "status": "error",
+                "content": "工具确认请求不存在或已过期，请重新发起本轮对话。",
+            }
+            return
+
+        if pending.user_id and current_user_id and str(current_user_id) != str(pending.user_id):
+            yield {
+                "type": "error",
+                "status": "error",
+                "content": "当前用户无权确认该工具调用。",
+            }
+            return
+
+        if pending.snapshot.kind == "external":
+            yield {
+                "type": "error",
+                "status": "error",
+                "content": "该请求为外部执行挂起，请使用 external execution 恢复接口。",
+            }
+            return
+
+        runner = self._build_agentscope_runner_from_pending(pending, user_info=user_info)
+        yield {
+            "type": "permission_result",
+            "status": "success" if confirmed else "rejected",
+            "permission_request_id": permission_request_id,
+            "tool_call_id": getattr(pending.tool_call, "id", None),
+        }
+
+        full_response_content = ""
+        execution_status = "success" if confirmed else "rejected"
+        start_time = asyncio.get_running_loop().time()
+        async for chunk in runner.resume_agentscope_native_confirmation(
+            pending,
+            confirmed=confirmed,
+        ):
+            full_response_content = _accumulate_stream_content(full_response_content, chunk)
+            yield chunk
+
+        p_tokens, c_tokens, t_tokens = 0, 0, 0
+        trace_buffer = runner.trace_buffer
+        try:
+            from app.services.ai.audit import aggregate_tokens_from_trace_buffer
+            p_tokens, c_tokens, t_tokens = aggregate_tokens_from_trace_buffer(trace_buffer) if trace_buffer else (0, 0, 0)
+        except Exception as e:
+            logger.warning(f"Failed to aggregate tokens after permission resume: {agg_err}")
+
+        if p_tokens or c_tokens:
+            yield {
+                "type": "meta",
+                "prompt_tokens": p_tokens,
+                "completion_tokens": c_tokens,
+                "total_tokens": t_tokens,
+            }
+
+        agent_config = runner.config
+        conversation_id = runner.conversation_id or pending.snapshot.conversation_id
+        user_query = (pending.state or {}).get("user_query") or ""
+
+        if conversation_id and full_response_content:
+            u_id = user_info.get("user_id") if user_info else pending.user_id
+            handled_by = getattr(agent_config, "agent_name", None) if agent_config else None
+            asyncio.create_task(memory_service.add_message(
+                u_id,
+                conversation_id,
+                "assistant",
+                full_response_content,
+                trace_id=pending.trace_id,
+                agent_name=handled_by,
+                prompt_tokens=p_tokens,
+                completion_tokens=c_tokens,
+            ))
+
+        duration = (asyncio.get_running_loop().time() - start_time) * 1000
+        asyncio.create_task(AuditManager.log_transaction(
+            pending.trace_id,
+            agent_config,
+            user_query,
+            full_response_content,
+            user_info,
+            execution_status,
+            duration,
+            trace_buffer,
+            conversation_id=conversation_id,
+        ))
+
+        if (
+            conversation_id
+            and execution_status == "success"
+            and full_response_content
+            and user_info
+            and user_info.get("user_id")
+        ):
+            from app.services.ai.session_summary_service import SessionSummaryService
+            asyncio.create_task(
+                SessionSummaryService.merge_session_summary(
+                    str(user_info.get("user_id")), conversation_id, full_response_content
+                )
+            )
+
+    def _build_agentscope_runner_from_pending(
+        self,
+        pending: Any,
+        *,
+        user_info: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """
+        用于从挂起的工具确认请求构建 AgentScope 运行器。
+        它会接收挂起的工具确认请求和用户信息，返回对应的 AgentScope 运行器。
+        """
+        runner = pending.runner
+        if runner is not None:
+            return runner
+
+        ctx = pending.snapshot.runner_context or {}
+        if ctx.get("runner_type") == "data":
+            from app.services.ai.runners.data_agent_runner import DataAgentRunner
+
+            return DataAgentRunner.from_runner_context(
+                runner_context=ctx,
+                trace_id=pending.trace_id,
+                trace_buffer=[],
+                user_info=user_info,
+                conversation_id=pending.conversation_id,
+            )
+
+        from app.services.ai.runners.assistant_agent_runner import AssistantAgentRunner
+
+        if ctx.get("runner_type") in ("assistant", "general"):
+            return AssistantAgentRunner.from_runner_context(
+                runner_context=ctx,
+                trace_id=pending.trace_id,
+                trace_buffer=[],
+                user_info=user_info,
+                conversation_id=pending.snapshot.conversation_id,
+            )
+
+        raise ValueError(f"Unsupported runner_type for resume: {ctx.get('runner_type')!r}")
+
+    @staticmethod
+    def _build_external_execution_results(results: List[Dict[str, Any]]) -> List[Any]:
+        """
+        用于将外部执行结果转换为 AgentScope 格式。
+        """
+        from agentscope.message import ToolResultBlock, ToolResultState
+
+        state_map = {
+            "success": ToolResultState.SUCCESS,
+            "error": ToolResultState.ERROR,
+            "running": ToolResultState.RUNNING,
+            "interrupted": ToolResultState.INTERRUPTED,
+            "denied": ToolResultState.DENIED,
+        }
+        return [
+            ToolResultBlock(
+                id=str(item.get("id") or ""),
+                name=str(item.get("name") or ""),
+                output=str(item.get("output") or ""),
+                state=state_map.get(str(item.get("state") or "success").lower(), ToolResultState.SUCCESS),
+            )
+            for item in results
+        ]
+
+    async def resume_agentscope_external_execution_stream(
+        self,
+        *,
+        external_execution_request_id: str,
+        results: List[Dict[str, Any]],
+        user_info: Optional[Dict[str, Any]] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        用于恢复外部执行请求的流式响应。
+        它会接收外部执行请求 ID、外部执行结果和用户信息，返回对应的流Scope 响应。
+        """
+        from app.services.ai.runtime.agentscope.confirmations import (
+            pending_agentscope_confirmations,
+        )
+
+        current_user_id = None
+        if user_info:
+            current_user_id = user_info.get("user_id") or user_info.get("id")
+
+        pending = await pending_agentscope_confirmations.pop_async(
+            external_execution_request_id,
+            user_id=current_user_id,
+        )
+
+        if not pending:
+            yield {
+                "type": "error",
+                "status": "error",
+                "content": "外部执行请求不存在或已过期，请重新发起本轮对话。",
+            }
+            return
+
+        if pending.user_id and current_user_id and str(current_user_id) != str(pending.user_id):
+            yield {
+                "type": "error",
+                "status": "error",
+                "content": "当前用户无权提交该外部执行结果。",
+            }
+            return
+
+        if pending.snapshot.kind != "external":
+            yield {
+                "type": "error",
+                "status": "error",
+                "content": "该请求不是外部执行挂起，请使用 permission confirm 接口。",
+            }
+            return
+
+        runner = self._build_agentscope_runner_from_pending(pending, user_info=user_info)
+        execution_results = self._build_external_execution_results(results)
+
+        yield {
+            "type": "external_execution_result",
+            "status": "success",
+            "external_execution_request_id": external_execution_request_id,
+            "tool_call_id": getattr(pending.tool_call, "id", None),
+        }
+
+        full_response_content = ""
+        execution_status = "success"
+        start_time = asyncio.get_running_loop().time()
+        async for chunk in runner.resume_agentscope_external_execution(
+            pending,
+            execution_results=execution_results,
+        ):
+            full_response_content = _accumulate_stream_content(full_response_content, chunk)
+            if chunk.get("status") == "error":
+                execution_status = "error"
+            yield chunk
+
+        p_tokens, c_tokens, t_tokens = 0, 0, 0
+        trace_buffer = runner.trace_buffer
+        try:
+            from app.services.ai.audit import aggregate_tokens_from_trace_buffer
+            p_tokens, c_tokens, t_tokens = aggregate_tokens_from_trace_buffer(trace_buffer) if trace_buffer else (0, 0, 0)
+        except Exception as agg_err:
+            logger.warning(f"Failed to aggregate tokens after external resume: {agg_err}")
+
+        if p_tokens or c_tokens:
+            yield {
+                "type": "meta",
+                "prompt_tokens": p_tokens,
+                "completion_tokens": c_tokens,
+                "total_tokens": t_tokens,
+            }
+
+        agent_config = runner.config
+        conversation_id = runner.conversation_id or pending.snapshot.conversation_id
+        user_query = (pending.state or {}).get("user_query") or ""
+
+        if conversation_id and full_response_content:
+            u_id = user_info.get("user_id") if user_info else pending.user_id
+            handled_by = getattr(agent_config, "agent_name", None) if agent_config else None
+            asyncio.create_task(memory_service.add_message(
+                u_id,
+                conversation_id,
+                "assistant",
+                full_response_content,
+                trace_id=pending.trace_id,
+                agent_name=handled_by,
+                prompt_tokens=p_tokens,
+                completion_tokens=c_tokens,
+            ))
+
+        duration = (asyncio.get_running_loop().time() - start_time) * 1000
+        asyncio.create_task(AuditManager.log_transaction(
+            pending.trace_id,
+            agent_config,
+            user_query,
+            full_response_content,
+            user_info,
+            execution_status,
+            duration,
+            trace_buffer,
+            conversation_id=conversation_id,
+        ))
+
+    async def _execute_multi_agent(
+        self,
+        primary_config: ChatConfig,
+        secondary_agent_ids: List[str],
+        user_query: str,
+        messages: List[Dict[str, str]],
+        trace_id: str,
+        trace_buffer: List[AgentExecutionStep],
+        debug_options: Dict[str, Any],
+        permission_options: Optional[Dict[str, Any]],
+        user_info: Optional[Dict[str, Any]],
+        api_key: Optional[str],
+        conversation_id: Optional[str] = None,
+        session_turn=None,
+        route_hints: Optional[Dict[str, Any]] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        并行执行主智能体和辅助智能体，合并结果并返回流式响应。
+        :param primary_config: 主智能体配置
+        :param secondary_agent_ids: 辅助智能体 ID列表
+        :param user_query: 用户查询
+        :param messages: 消息列表
+        :param trace_id: 跟踪 ID
+        :param trace_buffer: 执行步骤缓冲区
+        :param debug_options: 调试选项
+        :param permission_options: 权限选项
+        :param user_info: 用户信息
+        :param api_key: API 键
+        :param conversation_id: 对话 ID
+        :param session_turn: 会话轮次
+        :param route_hints: 路由提示
+        :return: 异步生成器，生成合并后的流式响应
+        """
+        from app.services.ai.turn_classifier import turn_type_label
+
+        if session_turn:
+            tc, _, tc_elapsed = session_turn
+            yield {
+                "type": "log",
+                "title": "分析用户请求并进行意图识别",
+                "details": f"{turn_type_label(tc.turn_type)}。{tc.reasoning}",
+                "status": "success",
+                "category": "intent",
+                "turn_type": tc.turn_type.value,
+                "execution_time_ms": tc_elapsed,
+            }
+
+        # 1. 处理辅助智能体配置
+        secondary_configs = []
+        async with AsyncSessionLocal() as session:
+            for s_id in secondary_agent_ids:
+                s_config = await AgentManagerService.get_active_agent_config(session, agent_id=s_id)
+                if s_config:
+                    secondary_configs.append(s_config)
+
+        # 2. 设置执行器
+        all_configs = [primary_config] + secondary_configs
+        executors = []
+        for config in all_configs:
+            exec = await AgentDispatcher.dispatch(
+                config,
+                user_query,
+                messages,
+                trace_id,
+                trace_buffer,
+                debug_options,
+                permission_options,
+                user_info,
+                conversation_id,
+                shared_turn=session_turn,
+                route_hints=route_hints,
+            )
+            executors.append(exec)
+
+        yield {
+            "type": "log",
+            "title": "多智能体协作",
+            "details": f"正在并行调度 {len(executors)} 个专家智能体: " + ", ".join([c.agent_name for c in all_configs]),
+            "status": "success"
+        }
+
+        # 3. 并行执行并流式传输日志队列
+        queue = asyncio.Queue()
+
+        async def run_executor(executor, config):
+            full_text = ""
+            try:
+                # We need a clean copy of messages for each executor as they might modify it?
+                # Actually most executors just read it.
+                async for chunk in executor.execute(messages):
+                    if "content" in chunk:
+                        full_text += chunk["content"]
+                    elif "type" in chunk and chunk["type"] in ["log", "router_log"]:
+                        # Prefix log title with Agent Name to identify the source
+                        if "title" in chunk:
+                             chunk["title"] = f"[{config.agent_name}] {chunk['title']}"
+                        await queue.put(chunk)
+                    elif "type" in chunk and chunk["type"] == "thinking":
+                        # Forward thinking status (might overlap, but SSE handles it)
+                        await queue.put(chunk)
+            except Exception as e:
+                logger.error(f"Error in multi-agent sub-task ({config.agent_name}): {e}", exc_info=True)
+                await queue.put({
+                    "type": "log",
+                    "title": f"[{config.agent_name}] 执行异常",
+                    "details": str(e),
+                    "status": "error"
+                })
+                full_text = f"【{config.agent_name} 执行失败】: {str(e)}"
+            return {"name": config.agent_name, "content": full_text}
+
+        # 并行执行所有智能体
+        tasks = [asyncio.create_task(run_executor(exec, conf)) for exec, conf in zip(executors, all_configs)]
+        results_task = asyncio.gather(*tasks)
+
+        # 流式传输日志队列
+        while not results_task.done() or not queue.empty():
+            try:
+                # Use wait_for to check done status frequently
+                chunk = await asyncio.wait_for(queue.get(), timeout=0.1)
+                yield chunk
+                queue.task_done()
+            except (asyncio.TimeoutError, asyncio.QueueEmpty):
+                if results_task.done() and queue.empty():
+                    break
+                await asyncio.sleep(0.01)
+
+        agent_outputs = await results_task
+
+        # 4. 最终聚合
+        yield {
+            "type": "log",
+            "title": "结果聚合",
+            "details": "正在汇总各专家意见并组织最终回答...",
+            "status": "success"
+        }
+
+        async for chunk in self._synthesize_multi_agent_results(
+            primary_config, user_query, agent_outputs, trace_buffer
+        ):
+            yield chunk
+
+    async def _synthesize_multi_agent_results(
+        self,
+        config: ChatConfig,
+        user_query: str,
+        agent_outputs: List[Dict[str, str]],
+        trace_buffer: List[AgentExecutionStep],
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        合并多个智能体的输出为一个统一的响应。
+        """
+        outputs_str = ""
+        for out in agent_outputs:
+            outputs_str += f"### 专家智能体: {out['name']}\n{out['content']}\n\n"
+
+        system_prompt = AgentServicePrompts.MULTI_AGENT_SYNTHESIS_SYSTEM
+
+        human_content = AgentServicePrompts.multi_agent_synthesis_human(user_query, outputs_str)
+
+        # Use synthesis model from primary agent config
+        llm = await AgentConfigProvider.get_synthesis_llm(streaming=True, config=config)
+
+        lc_messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=human_content)
+        ]
+
+        start_synthesis = time.time()
+        full_content = ""
+        accumulated_msg = None
+        async for chunk in llm.astream(lc_messages):
+            if accumulated_msg is None:
+                accumulated_msg = chunk
+            else:
+                accumulated_msg += chunk
+            if chunk.content:
+                full_content += chunk.content
+                yield {"content": chunk.content}
+
+        tokens = extract_tokens_from_message(accumulated_msg)
+        step_number = max((s.step_number for s in trace_buffer), default=0) + 1
+        s_model = getattr(llm, "model_name", config.synthesis_model_name or config.model_name)
+        s_temp = config.synthesis_temperature or config.temperature
+        trace_buffer.append(
+            AgentExecutionStep(
+                step_number=step_number,
+                event_type="synthesis",
+                agent_name=config.agent_name,
+                model=str(s_model),
+                temperature=float(s_temp or 0),
+                tool_output={"content": full_content, "multi_agent_synthesis": True},
+                raw_log=full_content,
+                execution_time_ms=(time.time() - start_synthesis) * 1000,
+                prompt_tokens=tokens["prompt_tokens"],
+                completion_tokens=tokens["completion_tokens"],
+                total_tokens=tokens["total_tokens"],
+                timestamp=datetime.fromtimestamp(start_synthesis),
+            )
+        )
+
+    def __init__(self):
+        pass
+
+agent_service = AgentService()

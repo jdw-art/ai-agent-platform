@@ -60,7 +60,6 @@ portal_router.include_router(ragflow.router, prefix="/ragflow", tags=["RAGFlow�
 # 15. MCP 管理 (MCP Management)
 portal_router.include_router(mcp.router, prefix="/mcp", tags=["MCP管理"], dependencies=[Depends(require_api_key)])
 
-
 # 16. 变更日志 (Changelog)
 portal_router.include_router(changelog.router, prefix="/changelog", tags=["变更日志"], dependencies=[Depends(require_api_key)])
 
