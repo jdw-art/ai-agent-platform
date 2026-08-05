@@ -14,3 +14,4 @@ v1_secured.include_router(fs.router, prefix="/chat/fs", tags=["V1 文件系统�
 
 v1_router = APIRouter()
 v1_router.include_router(v1_secured)
+v1_router.include_router(chatbi.public_router, prefix="/chatbi", tags=["V1 ChatBI"])
