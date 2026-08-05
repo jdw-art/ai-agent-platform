@@ -172,7 +172,7 @@ async def get_database_schema(
     yaml_outputs = []
     hits = []
     for ds in found_datasets:
-        yaml_text = await MetadataService.export_dataset_yaml(conn, ds, id)
+        yaml_text = await MetadataService.export_dataset_yaml(conn, ds.id)
         yaml_outputs.append(yaml_text)
         hits.append(SchemaHit(id=ds.id, name=ds.name, display_name=ds.display_name))
 
