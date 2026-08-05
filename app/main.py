@@ -57,14 +57,14 @@ async def lifespan(app: FastAPI):
     await GlobalHttpClient.get_client()
     
     # Start Task Scheduler
-    # from app.services.ai.scheduler_service import scheduler_service
-    # await scheduler_service.start()
+    from app.services.ai.scheduler_service import scheduler_service
+    await scheduler_service.start()
 
-    # try:
-    #     from app.services.ai.memory_index_service import MemoryIndexService
-    #     await MemoryIndexService.ensure_index()
-    # except Exception as e:
-    #     logging.warning("Memory RediSearch index init skipped: %s", e)
+    try:
+        from app.services.ai.memory_index_service import MemoryIndexService
+        await MemoryIndexService.ensure_index()
+    except Exception as e:
+        logging.warning("Memory RediSearch index init skipped: %s", e)
     
     yield
     # Shutdown
