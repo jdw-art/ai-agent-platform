@@ -8,7 +8,7 @@ from fastapi.exceptions import RequestValidationError # Import Validation Error
 from contextlib import asynccontextmanager
 from typing import Optional
 from app.api.portal.api import portal_router
-# from app.api.v1.api import v1_router
+from app.api.v1.api import v1_router
 from app.core.config import settings
 from app.core import database, redis
 from app.core.middleware import AccessLogMiddleware
@@ -264,7 +264,7 @@ app.add_middleware(
 
 # Routers
 # 挂载 API V1 路由 (外部集成接口)
-# app.include_router(v1_router, prefix="/api/v1")
+app.include_router(v1_router, prefix="/api/v1")
 
 # 挂载流程控制门户路由 (管理控制台)
 app.include_router(portal_router, prefix="/api/portal")

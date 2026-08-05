@@ -89,7 +89,7 @@ class AgentConfigProvider:
                     # 获取已注册的模型，检查是否需要重写 API 密钥/BaseURL
                     if ai_model.api_key:
                         api_key = ai_model.api_key
-                    if ai_model.base_url:
+                    if ai_model.api_base_url:
                         base_url = ai_model.api_base_url
 
                     # 将模型字符串更新为提供者所需的实际 model_id

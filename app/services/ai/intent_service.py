@@ -276,15 +276,14 @@ class IntentService:
         self._llm = None
 
     @staticmethod
-    def _format_instructions(self) -> str:
-        """格式化指令模板"""
-        return {
+    def _format_instructions() -> str:
+        return (
             "返回一个 JSON 对象，字段为："
             "intent（DATA_QUERY/KNOWLEDGE_BASE/GENERAL/UNKNOWN）、"
             "confidence（0 到 1 的数字）、"
             "reasoning（简短原因）、"
             "entities（字符串数组）。"
-        }
+        )
 
     @staticmethod
     def _parse_response(raw: str) -> IntentResponse:

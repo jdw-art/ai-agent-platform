@@ -289,7 +289,7 @@ async def resolve_turn_classification(
 
     intent_info = None
     intent_elapsed_ms = 0.0
-    if classification is not None:
+    if classification is None:
         intent_start = time.time()
         prior_messages = messages[:-1] if messages else None
         intent_info = await intent_service.identify_intent(user_query, history=prior_messages)

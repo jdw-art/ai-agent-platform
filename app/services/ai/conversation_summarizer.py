@@ -75,7 +75,7 @@ class ConversationSummarizer:
         return any(m in msg for m in retry_markers)
 
     @staticmethod
-    async def _generate_with_retrn(chat_client: Any, messages: List[RuntimeMessage], *, max_retries: int = 3) -> str:
+    async def _generate_with_retry(chat_client: Any, messages: List[RuntimeMessage], *, max_retries: int = 3) -> str:
         last_err: Exception | None = None
         for attempt in range(max_retries):
             try:
